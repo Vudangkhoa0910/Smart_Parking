@@ -1,39 +1,53 @@
 /*
- * sensor_node.ino — ParkingLite Sensor Node v1.0
+ * sensor_node.ino — ParkingLite Sensor Node v1.1
  *
  * Hardware:  ESP32-CAM AI-Thinker (OV2640 + 4MB PSRAM)
  * Framework: Arduino + ESP32 core 3.3.x
  * Protocol:  ESP-NOW broadcast (no router required)
  *
  * Algorithm: Integer MAD — 11-method ensemble, F1=0.985 on 54K samples
- * Payload:   { node_id: uint8, bitmap: uint8 } — 2 bytes per scan
+ *
+ * Deployment workflow (no re-flash needed per lot):
+ *   1. Flash firmware once (with NODE_ID set in config.h)
+ *   2. SNAP_COLOR → capture the lot from camera view
+ *   3. Use ROI calibration tool to draw slot regions on image
+ *   4. ROI_LOAD n x0 y0 w0 h0 x1 y1 w1 h1 ... → saves to NVS
+ *   5. CAL → calibrate classifier with empty lot → saved to NVS
+ *   6. Device runs autonomously. Survives reboots.
+ *
+ * ESP-NOW payload (8 bytes, versioned):
+ *   { version, lot_id, node_id, n_slots, bitmap, seq, tx_power, reserved }
+ *   + periodic HEARTBEAT even when no change (for link quality monitoring)
  *
  * Serial commands (115200 baud):
- *   CAL            — Calibrate with current (empty-lot) frame → NVS
- *   RESET          — Clear calibration from NVS
- *   STATUS         — Print slot states and system info
- *   METHOD X       — Switch classification method (0–10)
- *   INTERVAL X     — Set scan interval in ms (1000–60000)
- *   ROI X Y W H I  — Override ROI for slot I
+ *   CAL            — Calibrate classifier with empty lot → NVS
+ *   RESET          — Clear calibration
+ *   STATUS         — Print system status
+ *   METHOD X       — Set classification method (0–10)
+ *   INTERVAL X     — Set scan interval ms (1000–60000)
+ *   ROI X Y W H I  — Set single ROI slot I
+ *   ROI_LOAD N x0 y0 w0 h0 ... — Bulk-load N slots → NVS
  *   ROI_GET        — Print ROI config as JSON
+ *   ROI_CLEAR      — Clear ROI config from NVS (reverts to defaults)
  *   SLOTS_GET      — Print last classification results as JSON
- *   SNAP           — Capture and stream grayscale JPEG via serial
- *   SNAP_COLOR     — Capture color SVGA JPEG via serial
- *   SNAP_XGA       — Capture color XGA JPEG via serial
- *   SNAP_UXGA      — Capture color UXGA JPEG via serial
- *   FLASH 0/1/2    — LED off / on / momentary
+ *   SNAP           — Grayscale JPEG stream
+ *   SNAP_COLOR     — Color SVGA JPEG stream
+ *   SNAP_XGA / SNAP_UXGA — Higher resolution color
+ *   FLASH 0/1/2    — LED control
  *   PING           — Connectivity check
  *
- * ParkingLite v1.0 — Phenikaa University NCKH 2025-2026
+ * ParkingLite v1.1 — Phenikaa University NCKH 2025-2026
  */
 
 #include <Arduino.h>
 #include "esp_camera.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "img_converters.h"
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 
 #include "camera_config.h"
 #include "roi_classifier.h"
@@ -41,13 +55,26 @@
 
 static const char *TAG = "SENSOR_NODE";
 
-// ─── ESP-NOW Payload ────────────────────────────────────────────────
-typedef struct __attribute__((packed)) {
-    uint8_t node_id;
-    uint8_t bitmap;
-} espnow_payload_t;
+// ─── NVS Keys ───────────────────────────────────────────────────────
+#define NVS_NAMESPACE     "parklite"
+#define NVS_KEY_N_SLOTS   "n_slots"
+#define NVS_KEY_ROI_DATA  "roi_data"
 
-static espnow_payload_t tx_payload;
+// ─── ESP-NOW Payload v2 (8 bytes, backwards-detectable) ─────────────
+#define PAYLOAD_VERSION 2
+
+typedef struct __attribute__((packed)) {
+    uint8_t  version;     // Protocol version (2)
+    uint8_t  lot_id;      // Parking lot ID
+    uint8_t  node_id;     // Sensor node ID
+    uint8_t  n_slots;     // Active slot count (1–8)
+    uint8_t  bitmap;      // Occupancy bitmap (bit per slot)
+    uint8_t  seq;         // Sequence number (0–255 wrapping)
+    int8_t   tx_power;    // TX power in dBm (for receiver RSSI calibration)
+    uint8_t  flags;       // Bit 0: is_heartbeat, Bit 1: has_calibration
+} espnow_payload_v2_t;
+
+static espnow_payload_v2_t tx_payload;
 static esp_now_peer_info_t peer_info;
 static const uint8_t BROADCAST_ADDR[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -57,7 +84,12 @@ static uint8_t  last_tx_bitmap   = 0xFF;   // 0xFF forces first transmission
 static uint8_t  classify_method  = DEFAULT_METHOD;
 static uint32_t scan_interval    = SCAN_INTERVAL_MS;
 static uint32_t last_scan_ms     = 0;
+static uint32_t last_heartbeat_ms = 0;
 static uint32_t frame_count      = 0;
+static uint8_t  tx_seq           = 0;      // Wrapping sequence number
+static uint32_t tx_success_count = 0;
+static uint32_t tx_fail_count    = 0;
+static uint8_t  n_slots          = N_SLOTS_DEFAULT;
 static classify_result_t slot_results[MAX_SLOTS];
 static roi_rect_t slot_rois[MAX_SLOTS];
 
@@ -79,11 +111,14 @@ static const char *METHOD_NAMES[NUM_METHODS] = {
 // ─── Forward Declarations ───────────────────────────────────────────
 static bool init_camera(void);
 static void process_frame(void);
-static void espnow_broadcast(uint8_t bitmap);
+static void espnow_broadcast(uint8_t bitmap, bool is_heartbeat);
 static void handle_serial_command(void);
 static void print_status(void);
 static void led_flash(uint8_t mode);
 static bool capture_color_jpeg(framesize_t fsize, int quality, const char *label);
+static bool load_roi_from_nvs(void);
+static bool save_roi_to_nvs(void);
+static void clear_roi_nvs(void);
 
 
 // ═════════════════════════════════════════════════════════════════════
@@ -107,19 +142,26 @@ void setup() {
     Serial.begin(115200);
     Serial.println();
     Serial.println("╔═══════════════════════════════════╗");
-    Serial.println("║   ParkingLite Sensor Node v1.0    ║");
+    Serial.println("║   ParkingLite Sensor Node v1.1    ║");
     Serial.println("║   ESP32-CAM + ESP-NOW              ║");
     Serial.println("╚═══════════════════════════════════╝");
     Serial.println();
 
-    // Copy config ROI table to mutable runtime state
-    memcpy(slot_rois, SLOT_ROIS, sizeof(slot_rois));
-
-    // NVS for calibration persistence
+    // NVS for calibration + ROI persistence
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
+    }
+
+    // Load ROI from NVS (or use defaults from config.h)
+    if (!load_roi_from_nvs()) {
+        memcpy(slot_rois, DEFAULT_SLOT_ROIS, sizeof(slot_rois));
+        n_slots = N_SLOTS_DEFAULT;
+        Serial.printf("[ROI] Using defaults: %d slots (no NVS config found)\n", n_slots);
+        Serial.println("      Use ROI_LOAD to set per-lot layout → saved to NVS");
+    } else {
+        Serial.printf("[ROI] Loaded from NVS: %d slots\n", n_slots);
     }
 
     // Camera
@@ -143,6 +185,8 @@ void setup() {
     // ESP-NOW
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    // Set TX power for range optimization
+    esp_wifi_set_max_tx_power(ESPNOW_TX_POWER * 4);  // API uses 0.25 dBm units
     if (esp_now_init() != ESP_OK) {
         Serial.println("[FATAL] ESP-NOW init failed");
         while (1) delay(1000);
@@ -154,7 +198,8 @@ void setup() {
     if (esp_now_add_peer(&peer_info) != ESP_OK) {
         Serial.println("[ERROR] Failed to add broadcast peer");
     } else {
-        Serial.println("[OK] ESP-NOW: broadcast mode ready");
+        Serial.printf("[OK] ESP-NOW: ch=%d txpwr=%ddBm heartbeat=%ds\n",
+                      ESPNOW_CHANNEL, ESPNOW_TX_POWER, HEARTBEAT_INTERVAL / 1000);
     }
 
     // LED ready indicator
@@ -162,7 +207,7 @@ void setup() {
     led_flash(2);
 
     Serial.printf("\n[READY] Node=0x%02X Lot=0x%02X Method=%d Interval=%ums Slots=%d\n\n",
-                  NODE_ID, LOT_ID, classify_method, scan_interval, N_SLOTS);
+                  NODE_ID, LOT_ID, classify_method, scan_interval, n_slots);
 }
 
 
@@ -180,6 +225,12 @@ void loop() {
     if (now - last_scan_ms >= scan_interval) {
         last_scan_ms = now;
         process_frame();
+    }
+
+    // Periodic heartbeat (even when bitmap unchanged, for link quality)
+    if (now - last_heartbeat_ms >= HEARTBEAT_INTERVAL) {
+        last_heartbeat_ms = now;
+        espnow_broadcast(current_bitmap, true);
     }
 
     delay(10);
@@ -261,7 +312,7 @@ static void process_frame(void) {
 
     current_bitmap = classify_all_slots(
         fb->buf, fb->width,
-        slot_rois, N_SLOTS,
+        slot_rois, n_slots,
         effective_method, slot_results
     );
     esp_camera_fb_return(fb);
@@ -270,19 +321,19 @@ static void process_frame(void) {
 
     // Count occupied slots
     uint8_t n_occupied = 0;
-    for (int i = 0; i < N_SLOTS; i++) {
+    for (int i = 0; i < n_slots; i++) {
         if (slot_results[i].prediction) n_occupied++;
     }
 
     Serial.printf("[%6u] Bitmap=0b", frame_count);
-    for (int i = N_SLOTS - 1; i >= 0; i--) Serial.print((current_bitmap >> i) & 1);
+    for (int i = n_slots - 1; i >= 0; i--) Serial.print((current_bitmap >> i) & 1);
     Serial.printf(" (0x%02X) | %ums | M%d | %d/%d occupied\n",
-                  current_bitmap, elapsed_ms, effective_method, n_occupied, N_SLOTS);
+                  current_bitmap, elapsed_ms, effective_method, n_occupied, n_slots);
 
     // Transmit on change only
     if (current_bitmap != last_tx_bitmap) {
         Serial.printf("         → CHANGE: 0x%02X → 0x%02X\n", last_tx_bitmap, current_bitmap);
-        espnow_broadcast(current_bitmap);
+        espnow_broadcast(current_bitmap, false);
         last_tx_bitmap = current_bitmap;
     }
 }
@@ -292,16 +343,36 @@ static void process_frame(void) {
 //  ESP-NOW Transmission
 // ═════════════════════════════════════════════════════════════════════
 
-static void espnow_broadcast(uint8_t bitmap) {
-    tx_payload.node_id = NODE_ID;
-    tx_payload.bitmap  = bitmap;
+static void espnow_broadcast(uint8_t bitmap, bool is_heartbeat) {
+    tx_payload.version  = PAYLOAD_VERSION;
+    tx_payload.lot_id   = LOT_ID;
+    tx_payload.node_id  = NODE_ID;
+    tx_payload.n_slots  = n_slots;
+    tx_payload.bitmap   = bitmap;
+    tx_payload.seq      = tx_seq++;
+    tx_payload.tx_power = ESPNOW_TX_POWER;
+    tx_payload.flags    = (is_heartbeat ? 0x01 : 0x00)
+                        | (classifier_is_calibrated() ? 0x02 : 0x00);
 
-    esp_err_t result = esp_now_send(BROADCAST_ADDR, (uint8_t *)&tx_payload, sizeof(tx_payload));
+    uint8_t retries = TX_RETRY_COUNT + 1;
+    esp_err_t result = ESP_FAIL;
+    for (uint8_t r = 0; r < retries; r++) {
+        result = esp_now_send(BROADCAST_ADDR, (uint8_t *)&tx_payload, sizeof(tx_payload));
+        if (result == ESP_OK) break;
+        delay(5);
+    }
+
     if (result == ESP_OK) {
-        Serial.printf("         [TX] Node=0x%02X Lot=0x%02X Bitmap=0x%02X\n",
-                      NODE_ID, LOT_ID, bitmap);
+        tx_success_count++;
+        Serial.printf("         [TX] seq=%u %s Node=0x%02X Bitmap=0x%02X (%u/%u ok)\n",
+                      tx_payload.seq, is_heartbeat ? "HB" : "EVT",
+                      NODE_ID, bitmap, tx_success_count,
+                      tx_success_count + tx_fail_count);
     } else {
-        Serial.printf("         [TX_ERROR] esp_now_send returned 0x%x\n", result);
+        tx_fail_count++;
+        Serial.printf("         [TX_FAIL] seq=%u err=0x%x (%u/%u ok)\n",
+                      tx_payload.seq, result, tx_success_count,
+                      tx_success_count + tx_fail_count);
     }
 }
 
@@ -410,7 +481,7 @@ static void handle_serial_command(void) {
         led_flash(1);
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb && fb->format == PIXFORMAT_GRAYSCALE) {
-            bool ok = classifier_calibrate(fb->buf, fb->width, slot_rois, N_SLOTS);
+            bool ok = classifier_calibrate(fb->buf, fb->width, slot_rois, n_slots);
             Serial.println(ok ? "[CAL] OK — calibration saved to NVS"
                               : "[CAL] FAILED — check NVS flash");
             if (ok) Serial.println("      Recommended: METHOD 10 (combined)");
@@ -463,24 +534,72 @@ static void handle_serial_command(void) {
     }
     else if (line == "ROI_GET") {
         Serial.print("[ROI_JSON] {\"node\":"); Serial.print(NODE_ID);
-        Serial.print(",\"slots\":[");
-        for (int i = 0; i < N_SLOTS; i++) {
+        Serial.printf(",\"n_slots\":%d,\"source\":\"%s\",\"slots\":[",
+                      n_slots, load_roi_from_nvs() ? "nvs" : "default");
+        for (int i = 0; i < n_slots; i++) {
             Serial.printf("{\"i\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
                          i, slot_rois[i].x, slot_rois[i].y, slot_rois[i].w, slot_rois[i].h);
-            if (i < N_SLOTS - 1) Serial.print(",");
+            if (i < n_slots - 1) Serial.print(",");
         }
         Serial.println("]}");
     }
     else if (line == "SLOTS_GET") {
         Serial.printf("[SLOTS_JSON] {\"node\":0x%02X,\"bitmap\":0x%02X,\"method\":%d,\"slots\":[",
                       NODE_ID, current_bitmap, classify_method);
-        for (int i = 0; i < N_SLOTS; i++) {
+        for (int i = 0; i < n_slots; i++) {
             Serial.printf("{\"i\":%d,\"occ\":%d,\"conf\":%d,\"raw\":%d}",
                          i, slot_results[i].prediction,
                          slot_results[i].confidence, slot_results[i].raw_metric);
-            if (i < N_SLOTS - 1) Serial.print(",");
+            if (i < n_slots - 1) Serial.print(",");
         }
         Serial.println("]}");
+    }
+    else if (line.startsWith("ROI_LOAD ")) {
+        // Bulk ROI load: ROI_LOAD N x0 y0 w0 h0 x1 y1 w1 h1 ...
+        const char *p = line.c_str() + 9;
+        int new_n = 0;
+        int consumed = 0;
+        if (sscanf(p, "%d%n", &new_n, &consumed) != 1 || new_n < 1 || new_n > MAX_SLOTS) {
+            Serial.println("[ERROR] ROI_LOAD N x0 y0 w0 h0 ... (N=1–8)");
+        } else {
+            p += consumed;
+            roi_rect_t tmp[MAX_SLOTS] = {};
+            bool ok = true;
+            for (int i = 0; i < new_n; i++) {
+                int x, y, w, h;
+                int c = 0;
+                if (sscanf(p, " %d %d %d %d%n", &x, &y, &w, &h, &c) != 4
+                    || x < 0 || y < 0 || w < 1 || h < 1
+                    || x + w > 320 || y + h > 240) {
+                    Serial.printf("[ERROR] Invalid ROI for slot %d\n", i);
+                    ok = false;
+                    break;
+                }
+                tmp[i] = { (uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h };
+                p += c;
+            }
+            if (ok) {
+                n_slots = new_n;
+                memcpy(slot_rois, tmp, sizeof(slot_rois));
+                if (save_roi_to_nvs()) {
+                    Serial.printf("[ROI_LOAD] %d slots saved to NVS ✓\n", n_slots);
+                    for (int i = 0; i < n_slots; i++) {
+                        Serial.printf("  Slot %d: (%d,%d,%d,%d)\n",
+                                      i, slot_rois[i].x, slot_rois[i].y,
+                                      slot_rois[i].w, slot_rois[i].h);
+                    }
+                    Serial.println("  → Run CAL to calibrate with empty lot");
+                } else {
+                    Serial.println("[ERROR] NVS write failed");
+                }
+            }
+        }
+    }
+    else if (line == "ROI_CLEAR") {
+        clear_roi_nvs();
+        memcpy(slot_rois, DEFAULT_SLOT_ROIS, sizeof(slot_rois));
+        n_slots = N_SLOTS_DEFAULT;
+        Serial.printf("[ROI_CLEAR] Reverted to %d default slots\n", n_slots);
     }
     else if (line == "SNAP" || line == "SNAPSHOT") {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -525,7 +644,9 @@ static void handle_serial_command(void) {
     else if (line.length() > 0) {
         Serial.println("Commands: CAL | RESET | STATUS | PING");
         Serial.println("          METHOD 0-10 | INTERVAL ms");
-        Serial.println("          ROI X Y W H I | ROI_GET | SLOTS_GET");
+        Serial.println("          ROI X Y W H I | ROI_GET | ROI_CLEAR");
+        Serial.println("          ROI_LOAD N x0 y0 w0 h0 x1 y1 ...");
+        Serial.println("          SLOTS_GET");
         Serial.println("          SNAP | SNAP_COLOR | SNAP_XGA | SNAP_UXGA");
         Serial.println("          FLASH 0/1/2");
     }
@@ -539,11 +660,13 @@ static void handle_serial_command(void) {
 static void print_status(void) {
     const char *mname = (classify_method < NUM_METHODS) ? METHOD_NAMES[classify_method] : "?";
     uint8_t n_occ = 0;
-    for (int i = 0; i < N_SLOTS; i++) if (slot_results[i].prediction) n_occ++;
+    for (int i = 0; i < n_slots; i++) if (slot_results[i].prediction) n_occ++;
+    uint32_t total_tx = tx_success_count + tx_fail_count;
+    uint8_t loss_pct = total_tx > 0 ? (uint8_t)(tx_fail_count * 100 / total_tx) : 0;
 
     Serial.println();
     Serial.println("╔══════════════════════════════════════════════╗");
-    Serial.println("║    ParkingLite Sensor Node v1.0 — Status     ║");
+    Serial.println("║    ParkingLite Sensor Node v1.1 — Status     ║");
     Serial.println("╠══════════════════════════════════════════════╣");
     Serial.printf( "║  Node ID:        0x%02X  Lot ID: 0x%02X          ║\n", NODE_ID, LOT_ID);
     Serial.printf( "║  Method:         %2d %-14s            ║\n", classify_method, mname);
@@ -551,10 +674,19 @@ static void print_status(void) {
                    classifier_is_calibrated() ? "YES" : "NO");
     Serial.printf( "║  Scan interval:  %-5u ms                    ║\n", scan_interval);
     Serial.printf( "║  Frame count:    %-8u                    ║\n", frame_count);
-    Serial.printf( "║  Active slots:   %-2d  Occupied: %-2d           ║\n", N_SLOTS, n_occ);
+    Serial.printf( "║  Active slots:   %-2d  Occupied: %-2d           ║\n", n_slots, n_occ);
     Serial.printf( "║  Current bitmap: 0x%02X                        ║\n", current_bitmap);
-    Serial.println("╠══════════════════════════════════════════════╣");
-    for (int i = 0; i < N_SLOTS; i++) {
+    Serial.println("╠═══ ESP-NOW Link ═════════════════════════════╣");
+    Serial.printf( "║  TX power:    %2d dBm  Channel: %d             ║\n",
+                   ESPNOW_TX_POWER, ESPNOW_CHANNEL);
+    Serial.printf( "║  TX OK/Fail:  %lu / %lu (%d%% loss)%*s║\n",
+                   tx_success_count, tx_fail_count, loss_pct,
+                   (int)(8 - String(loss_pct).length()), "");
+    Serial.printf( "║  Heartbeat:   every %ds                     ║\n",
+                   HEARTBEAT_INTERVAL / 1000);
+    Serial.printf( "║  Seq counter: %u                              ║\n", tx_seq);
+    Serial.println("╠═══ Slot Details ═════════════════════════════╣");
+    for (int i = 0; i < n_slots; i++) {
         const char *state = slot_results[i].prediction ? "OCC " : "FREE";
         Serial.printf("║  Slot %d: %s  conf=%3d%%  raw=%5d        ║\n",
                       i, state, slot_results[i].confidence, slot_results[i].raw_metric);
@@ -575,5 +707,56 @@ static void led_flash(uint8_t mode) {
         digitalWrite(FLASH_LED_PIN, HIGH);
         delay(200);
         digitalWrite(FLASH_LED_PIN, LOW);
+    }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════
+//  NVS — ROI Persistence
+//  Stores ROI layout so each parking lot keeps its config across reboots.
+// ═════════════════════════════════════════════════════════════════════
+
+static bool load_roi_from_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+
+    uint8_t stored_n = 0;
+    if (nvs_get_u8(nvs, NVS_KEY_N_SLOTS, &stored_n) != ESP_OK || stored_n < 1 || stored_n > MAX_SLOTS) {
+        nvs_close(nvs);
+        return false;
+    }
+
+    size_t blob_len = sizeof(roi_rect_t) * MAX_SLOTS;
+    roi_rect_t buf[MAX_SLOTS] = {};
+    if (nvs_get_blob(nvs, NVS_KEY_ROI_DATA, buf, &blob_len) != ESP_OK) {
+        nvs_close(nvs);
+        return false;
+    }
+
+    n_slots = stored_n;
+    memcpy(slot_rois, buf, sizeof(slot_rois));
+    nvs_close(nvs);
+    return true;
+}
+
+static bool save_roi_to_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return false;
+
+    bool ok = true;
+    ok = ok && (nvs_set_u8(nvs, NVS_KEY_N_SLOTS, n_slots) == ESP_OK);
+    ok = ok && (nvs_set_blob(nvs, NVS_KEY_ROI_DATA, slot_rois, sizeof(roi_rect_t) * MAX_SLOTS) == ESP_OK);
+    ok = ok && (nvs_commit(nvs) == ESP_OK);
+    nvs_close(nvs);
+    return ok;
+}
+
+static void clear_roi_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_key(nvs, NVS_KEY_N_SLOTS);
+        nvs_erase_key(nvs, NVS_KEY_ROI_DATA);
+        nvs_commit(nvs);
+        nvs_close(nvs);
     }
 }
