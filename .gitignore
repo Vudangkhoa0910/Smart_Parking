@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Arduino build artifacts
+*.elf
+*.hex
+*.bin
+*.map
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.orig
+
+# VS Code
+.vscode/settings.json
+.vscode/launch.json
+
+# Captured images (test artifacts)
+capture_direct_*.jpg
+capture_color_*.jpg
+*.snap.jpg
+Tools/parking_monitor/captures/
+
+# Sections still in development — not ready for production push
+Images/
+Simulation/
+Docs/
+Ideas/
+Poster/
+Prompt/
+
+# ROI tool has its own git repo (large, dev-only)
+ROI/
+
+# Secrets (never commit)
+*.env
+secrets.h
+credentials.h
+
