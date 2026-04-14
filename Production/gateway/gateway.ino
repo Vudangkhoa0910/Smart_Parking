@@ -133,15 +133,29 @@ static int8_t rssi_avg(const rssi_stats_t *s) {
     return (int8_t)(sum / s->count);
 }
 
-// RSSI → estimated distance (free-space path loss model)
-// distance = 10^((txPower - rssi - 41) / 20)  meters  (2.4 GHz)
+// RSSI → estimated distance (Log-Distance Path Loss model for parking lot)
+// PL(d) = PL(d0) + 10*n*log10(d/d0)
+// With d0=1m, PL_d0=40.05 dB (FSPL@2.4GHz@1m), n=2.8 (outdoor parking)
+// Antenna gain: TX 2dBi + RX 2dBi = 4 dBi total
+// PL_measured = tx_power + 4 - rssi
+// d = 10^((PL_measured - 40.05) / (10*n))
+#define PL_EXPONENT   2.8f    // Path loss exponent for outdoor parking lot
+#define PL_REF_1M     40.05f  // FSPL at 1m for 2.4 GHz
+#define ANTENNA_GAIN  4.0f    // TX(2dBi) + RX(2dBi)
+
 static float estimate_distance(int8_t tx_power, int8_t rssi) {
-    float exponent = (float)(tx_power - rssi - 41) / 20.0f;
+    float pl_measured = (float)tx_power + ANTENNA_GAIN - (float)rssi;
+    float exponent = (pl_measured - PL_REF_1M) / (10.0f * PL_EXPONENT);
+    if (exponent < 0) return 0.1f;   // closer than 1m
+    if (exponent > 4) return 9999.0f; // cap at ~10 km
+    // Efficient 10^x without math.h: integer part * fractional approx
     float dist = 1.0f;
-    for (int i = 0; i < (int)exponent; i++) dist *= 10.0f;
-    // fractional part
-    float frac = exponent - (int)exponent;
-    if (frac > 0.01f) dist *= (1.0f + frac * 2.3026f); // rough 10^frac approx
+    int   int_exp = (int)exponent;
+    float frac    = exponent - int_exp;
+    for (int i = 0; i < int_exp; i++) dist *= 10.0f;
+    // 10^frac ≈ 1 + frac*ln(10) + 0.5*(frac*ln(10))^2 (2nd order Taylor)
+    float fl = frac * 2.302585f; // frac * ln(10)
+    dist *= (1.0f + fl + 0.5f * fl * fl);
     return dist;
 }
 
@@ -396,7 +410,7 @@ void loop() {
                 Serial.printf("  RSSI avg:   %d dBm (%s)\n", avg, quality);
                 Serial.printf("  RSSI range: %d to %d dBm\n",
                               nodes[i].rssi.min_rssi, nodes[i].rssi.max_rssi);
-                Serial.printf("  Est. dist:  %.1f m (free-space model)\n", dist);
+                Serial.printf("  Est. dist:  %.1f m (log-distance n=%.1f)\n", dist, PL_EXPONENT);
                 Serial.printf("  Packets:    %lu received, %lu gaps (%.1f%% loss)\n",
                               nodes[i].rx_count, nodes[i].seq_gaps, loss_f);
                 Serial.printf("  Calibrated: %s\n\n", nodes[i].calibrated ? "YES" : "NO");
