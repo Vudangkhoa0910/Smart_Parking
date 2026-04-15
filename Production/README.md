@@ -165,12 +165,11 @@ Every received packet emits a JSON line:
 
 ## Classification Algorithm
 
-Integer MAD (Mean Absolute Difference) with 3-stage normalization:
+Integer MAD (Mean Absolute Difference) with per-ROI mean-shift normalization:
 
 ```
-Stage 1: Histogram Match  — global illumination correction
-Stage 2: Per-ROI Mean Shift — local brightness normalization
-Stage 3: MAD + Edge Density — pixel-level change detection
+Per-ROI Mean Shift  — local brightness normalization (normalize_brightness())
+Combined Ensemble   — 7 sub-methods weighted vote (classify_combined())
 ```
 
 | Method | Name | Accuracy | Calibration |

@@ -493,11 +493,11 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("Phương pháp:"))
         self.cb_method = QComboBox()
         methods = ["0: edge_density", "1: bg_relative", "2: ref_frame (MAD)",
-                   "3: hybrid ★", "4: gaussian_mad", "5: block_mad",
+                   "3: hybrid", "4: gaussian_mad", "5: block_mad",
                    "6: percentile_mad", "7: max_block", "8: histogram",
-                   "9: variance_ratio", "10: combined"]
+                   "9: variance_ratio", "10: combined ★"]
         self.cb_method.addItems(methods)
-        self.cb_method.setCurrentIndex(3)  # hybrid
+        self.cb_method.setCurrentIndex(10)  # combined (firmware default)
         self.cb_method.currentIndexChanged.connect(self._on_method_change)
         h.addWidget(self.cb_method, 1)
         cl.addLayout(h)

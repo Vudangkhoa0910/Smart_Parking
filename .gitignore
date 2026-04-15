@@ -46,6 +46,12 @@ Prompt/
 # ROI tool has its own git repo (large, dev-only)
 ROI/
 
+# Large binary files (not for git)
+Delivery_BaoCao_NCKH/
+Delivery_BaoCao_NCKH_ParkingLite.zip
+GRAND_DEBUG_ALL_7.png
+Images.zip
+
 # Secrets (never commit)
 *.env
 secrets.h
