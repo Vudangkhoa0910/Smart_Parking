@@ -42,15 +42,27 @@ Docs/
 Ideas/
 Poster/
 Prompt/
+New/
 
 # ROI tool has its own git repo (large, dev-only)
 ROI/
 
-# Large binary files (not for git)
+# Development/experimental firmware (superseded by Production/)
+build_esp32/
+
+# Internal research report drafts (not for public)
+Production/RESEARCH_REPORT_v2*.md
+Production/report_assets/guides/
+
+# Internal test reports
+TEST_REPORT.md
+
+# Large binary files / compiled outputs
 Delivery_BaoCao_NCKH/
 Delivery_BaoCao_NCKH_ParkingLite.zip
 GRAND_DEBUG_ALL_7.png
 Images.zip
+main.pdf
 
 # Secrets (never commit)
 *.env
